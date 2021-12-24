@@ -1,4 +1,6 @@
 from contextlib import closing
+import subprocess
+import threading
 
 import PySimpleGUI as sg
 import pyffish
@@ -7,6 +9,48 @@ MAX_FILES = 12
 MAX_RANKS = 10
 SQUARE_COLORS = ('#F0D9B5', '#B58863')
 PIECE_COLORS = ('white', 'black')
+
+
+class Engine():
+    def __init__(self, args, options=None):
+        self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
+        self.lock = threading.Lock()
+        self.options = options
+
+    def write(self, message):
+        with self.lock:
+            self.process.stdin.write(message)
+            self.process.stdin.flush()
+
+    def setoption(self, name, value):
+        self.write('setoption name {} value {}\n'.format(name, value))
+
+    def initialize(self):
+        message = 'uci\n'
+        for option, value in self.options.items():
+            message += self.process.stdin.write('setoption name {} value {}\n'.format(option, value))
+        self.write(message)
+
+    def newgame(self):
+        self.write('ucinewgame\n')
+
+    def position(self, fen=None, moves=None):
+        fen = 'fen {}'.format(fen) if fen else 'startpos'
+        moves = 'moves {}'.format(' '.join(moves)) if moves else ''
+        self.write('position {} {}\n'.format(fen, moves))
+
+    def analyze(self):
+        self.write('go infinite\n')
+
+    def stop(self):
+        self.write('stop\n')
+
+    def read(self):
+        while True:
+            line = self.process.stdout.readline()
+            if not line and self.process.poll() is not None:
+                break
+            yield line
 
 
 class GameState():
@@ -113,7 +157,7 @@ class Board():
             board_layout.append(row)
         return board_layout
 
-    def update_board(self, window):
+    def update(self, window):
         self.current_selection = None
         char_board = self.state.char_board()
         for i in range(MAX_RANKS):
@@ -137,15 +181,20 @@ class FairyGUI():
         sg.ChangeLookAndFeel('GreenTan')
 
         board_controls = [[sg.Button('New Game', key='_newgame_'), sg.Button('Load variants', key='_variants_')],
+                        [sg.Button('Load engine', key='_engine_'), sg.Button('Stop engine', key='_stop_')],
                         [sg.Button('Set FEN', key='_set_fen_'), sg.Button('Reset', key='_reset_')],
                         [sg.Button('Move', key='_move_'), sg.Button('Undo', key='_undo_')],
                         [sg.Text('Move List')],
                         [sg.Multiline(do_not_clear=True, autoscroll=True, size=(15, 10), key='_movelist_')],
+                        [sg.Text('Engine Output')],
+                        [sg.Multiline(do_not_clear=True, autoscroll=True, size=(15, 10), key='_engine_output_')],
                         ]
 
         self.board = Board()
         board_tab = [[sg.Column(self.board.draw_board())]]
         self.current_selection = None
+        self.engine = None
+        self.engine_thread = None
 
         layout = [[sg.Menu(menu_def, tearoff=False)],
                 [sg.TabGroup([[sg.Tab('Board', board_tab)]], title_color='red'),
@@ -172,14 +221,13 @@ class FairyGUI():
             squares = [self.board.idx2square(square) for square in (self.current_selection, button) if type(square) is tuple]
             moves = list(set(self.board.state.filter_legal(''.join(squares))
                                 + self.board.state.filter_legal(''.join(reversed(squares)))))
+            self.current_selection = None
             if len(moves) > 0:
                 if len(moves) > 1:
                     moves = self.popup(sg.Listbox, 'Choose move', moves, size=(20, 10))
                 if moves:
-                    move = moves[0]
-                    self.board.state.push(move)
-            self.board.update_board(self.window)
-            self.current_selection = None
+                    return moves[0]
+            self.update_board()
         else:
             moves = self.board.state.filter_legal(self.board.idx2square(button))
             if moves:
@@ -193,38 +241,92 @@ class FairyGUI():
                 self.window[button].update(button_color='green')
                 self.current_selection = button
 
+    def quit_engine(self):
+        if self.engine:
+            self.engine.process.terminate()
+        if self.engine_thread:
+            self.engine_thread.join()
+
+    def load_engine(self, engine_path):
+        self.quit_engine()
+        self.engine = Engine([engine_path])
+        def read_output():
+            for s in self.engine.read():
+                self.window['_engine_output_'].update(s)
+        self.engine_thread = threading.Thread(target=read_output)
+        self.engine_thread.start()
+        self.engine.setoption('UCI_Variant', self.board.state.variant)
+        self.engine.newgame()
+        self.engine.position(self.board.state.start_fen, self.board.state.moves)
+        self.engine.analyze()
+
+    def update_board(self, variant=None, fen=None, move=None, undo=False):
+        if self.engine and (variant or fen or move or undo):
+            self.engine.stop()
+
+        if variant:
+            self.board.state = GameState(variant)
+            if self.engine:
+                self.engine.setoption('UCI_Variant', variant)
+                self.engine.newgame()
+                self.engine.position()
+        if fen:
+            self.board.state = GameState(self.board.state.variant, fen)
+            if self.engine:
+                self.engine.position(fen)
+        if move:
+            self.board.state.push(move)
+            if self.engine:
+                self.engine.position(self.board.state.start_fen, self.board.state.moves)
+        if undo:
+            self.board.state.pop()
+            if self.engine:
+                self.engine.position(self.board.state.start_fen, self.board.state.moves)
+
+        if self.engine and (variant or fen or move or undo):
+            self.engine.analyze()
+
+        self.board.update(self.window)
+
     def run(self):
         self.window.finalize()
+        self.update_board()
         while True:
-            self.board.update_board(self.window)
-            while True:
-                button, value = self.window.Read()
-                if button in (None, 'Exit'):
-                    exit()
-                elif button == '_newgame_':
-                    variant = self.popup(sg.Listbox, 'Variant', pyffish.variants(), size=(30, 20))
-                    if variant:
-                        self.board.state = GameState(variant[0])
-                        break
-                elif button == '_set_fen_':
-                    fen = sg.popup_get_text('Set FEN', default_text=self.board.state.fen(), size=(80, 20))
-                    if fen:
-                        self.board.state = GameState(self.board.state.variant, fen)
-                        break
-                elif button == '_reset_':
-                    self.board.state = GameState(self.board.state.variant)
-                    break
-                elif button == '_undo_':
-                    self.board.state.pop()
-                    self.board.update_board(self.window)
-                elif button == '_variants_':
-                    variant_path = sg.popup_get_file('Select variants.ini',
-                                               file_types=(('variant configuration file', '*.ini'),))
-                    if variant_path:
-                        with open(variant_path) as variants_ini:
-                            pyffish.load_variant_config(variants_ini.read())
-                elif type(button) is tuple or button == '_move_':
-                    self.process_square(button)
+            button, value = self.window.Read()
+            if button in (None, 'Exit', sg.WIN_CLOSED):
+                self.quit_engine()
+                exit()
+            elif button == 'About...':
+                sg.popup('FairyFishGUI by Fabian Fichter\n\nhttps://github.com/ianfab/FairyFishGUI', title='About')
+            elif button == '_newgame_':
+                variant = self.popup(sg.Listbox, 'Variant', pyffish.variants(), size=(30, 20))
+                if variant:
+                    self.update_board(variant=variant[0])
+            elif button == '_set_fen_':
+                fen = sg.popup_get_text('Set FEN', default_text=self.board.state.fen(), size=(80, 20))
+                if fen:
+                    self.update_board(fen=fen)
+            elif button == '_reset_':
+                self.update_board(variant=self.board.state.variant)
+            elif button == '_undo_':
+                self.update_board(undo=True)
+            elif button == '_variants_':
+                variant_path = sg.popup_get_file('Select variants.ini',
+                                            file_types=(('variant configuration file', '*.ini'),))
+                if variant_path:
+                    with open(variant_path) as variants_ini:
+                        pyffish.load_variant_config(variants_ini.read())
+            elif button == '_engine_':
+                engine_path = sg.popup_get_file('Select engine')
+                if engine_path:
+                    self.load_engine(engine_path)
+            elif button == '_stop_':
+                if self.engine:
+                    self.engine.stop()
+            elif type(button) is tuple or button == '_move_':
+                move = self.process_square(button)
+                if move:
+                    self.update_board(move=move)
 
 
 if __name__ == '__main__':
